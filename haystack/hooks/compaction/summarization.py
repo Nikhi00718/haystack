@@ -197,10 +197,16 @@ class SummarizationCompactor(Compactor):
         :param token_counter: The counter used both to plan compaction and verify generated summaries.
         :returns: A smaller replacement conversation, or None when nothing was reduced.
         """
-        # How large each summary may be, and the run kwargs, if any, that hold the generator to it.
-        summary_tokens, run_kwargs = self._summary_limit()
+        # How large each summary may be. A recognized built-in generator is held to it by its own runtime setting;
+        # any other generator gets it as prompt guidance only, since the protocol guarantees nothing beyond `run`.
+        summary_tokens, generation_kwargs = _resolve_output_token_limit(
+            chat_generator=self.chat_generator, default_limit=self.max_summary_tokens
+        )
+        run_kwargs = {"generation_kwargs": generation_kwargs} if generation_kwargs else {}
+
         # Rebound only when a summary is applied, and never mutated, so `messages` is left as the caller passed it.
         compacted = messages
+        summarized = False
         while True:
             # Ask which stretch of the conversation to give up next. None means the target is met or nothing is left.
             plan = self._next_summary(
@@ -220,13 +226,14 @@ class SummarizationCompactor(Compactor):
                 compacted = self._apply_summary(
                     messages=compacted, indices=indices, source=source, result=result, token_counter=token_counter
                 )
+                summarized = True
             except Exception as error:
                 # Stop at the last summary that worked, unless `raise_on_failure` says to propagate.
                 self._report_failure(error=error)
                 break
-        # Every applied summary was measured as shrinking the conversation, so reaching here with anything other than
-        # the untouched input means real progress, whether or not the target was met.
-        return None if compacted is messages else compacted
+        # Every applied summary was measured as shrinking the conversation, so any summary at all is real progress,
+        # whether or not the target was met. Without one there is nothing to hand back.
+        return compacted if summarized else None
 
     async def compact_async(
         self, messages: list[ChatMessage], target_tokens: int, token_counter: TokenCounter
@@ -239,10 +246,16 @@ class SummarizationCompactor(Compactor):
         :param token_counter: The counter used both to plan compaction and verify generated summaries.
         :returns: A smaller replacement conversation, or None when nothing was reduced.
         """
-        # How large each summary may be, and the run kwargs, if any, that hold the generator to it.
-        summary_tokens, run_kwargs = self._summary_limit()
+        # How large each summary may be. A recognized built-in generator is held to it by its own runtime setting;
+        # any other generator gets it as prompt guidance only, since the protocol guarantees nothing beyond `run`.
+        summary_tokens, generation_kwargs = _resolve_output_token_limit(
+            chat_generator=self.chat_generator, default_limit=self.max_summary_tokens
+        )
+        run_kwargs = {"generation_kwargs": generation_kwargs} if generation_kwargs else {}
+
         # Rebound only when a summary is applied, and never mutated, so `messages` is left as the caller passed it.
         compacted = messages
+        summarized = False
         while True:
             # Ask which stretch of the conversation to give up next. None means the target is met or nothing is left.
             plan = self._next_summary(
@@ -264,13 +277,14 @@ class SummarizationCompactor(Compactor):
                 compacted = self._apply_summary(
                     messages=compacted, indices=indices, source=source, result=result, token_counter=token_counter
                 )
+                summarized = True
             except Exception as error:
                 # Stop at the last summary that worked, unless `raise_on_failure` says to propagate.
                 self._report_failure(error=error)
                 break
-        # Every applied summary was measured as shrinking the conversation, so reaching here with anything other than
-        # the untouched input means real progress, whether or not the target was met.
-        return None if compacted is messages else compacted
+        # Every applied summary was measured as shrinking the conversation, so any summary at all is real progress,
+        # whether or not the target was met. Without one there is nothing to hand back.
+        return compacted if summarized else None
 
     def _next_summary(
         self, messages: list[ChatMessage], target_tokens: int, token_counter: TokenCounter, summary_tokens: int
@@ -342,24 +356,6 @@ class SummarizationCompactor(Compactor):
             token_counter=token_counter,
         )
         return oldest_steps, _CURRENT_TASK_STEPS
-
-    def _summary_limit(self) -> tuple[int, dict[str, Any]]:
-        """
-        Work out how large one summary may be and how to hold the Chat Generator to it.
-
-        :returns: A tuple containing:
-
-            1. The token budget for a single summary. This is `max_summary_tokens`, unless the generator already
-               configures a recognized output limit of its own, in which case the generator's setting wins.
-            2. The kwargs to pass to the generator's `run`. This carries a `generation_kwargs` entry for a built-in
-               generator that has no limit configured, and is empty for every other generator, since the
-               `ChatGenerator` protocol does not standardize the setting. When it is empty, the budget reaches the
-               model only as prompt guidance and `_apply_summary` measures the result instead.
-        """
-        summary_tokens, generation_kwargs = _resolve_output_token_limit(
-            chat_generator=self.chat_generator, default_limit=self.max_summary_tokens
-        )
-        return summary_tokens, {"generation_kwargs": generation_kwargs} if generation_kwargs else {}
 
     def _prompt(self, messages: list[ChatMessage], indices: list[int], summary_tokens: int) -> list[ChatMessage]:
         """Build the bounded summarization instruction and the rendered transcript of the selected messages."""
