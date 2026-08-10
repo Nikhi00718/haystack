@@ -6,8 +6,8 @@ import pytest
 
 from haystack.dataclasses import ChatMessage, ChatRole, ToolCall
 from haystack.hooks.compaction import SlidingWindowCompactor
-from haystack.hooks.compaction.sliding_window import _DEFAULT_OMISSION_NOTE, _historical_turn_spans, _is_compaction_note
-from haystack.hooks.compaction.utils import _COMPACTION_META_KEY
+from haystack.hooks.compaction.sliding_window import _DEFAULT_OMISSION_NOTE, _is_compaction_note
+from haystack.hooks.compaction.utils import _COMPACTION_META_KEY, _historical_turn_spans
 from test.hooks.compaction.helpers import (
     FakeCounter,
     count_markers,
