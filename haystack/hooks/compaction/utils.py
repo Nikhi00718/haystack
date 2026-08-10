@@ -27,6 +27,11 @@ def _latest_user_index(messages: list[ChatMessage]) -> int | None:
     return None
 
 
+def _messages_at(messages: list[ChatMessage], indices: list[int]) -> list[ChatMessage]:
+    """Return the messages at the given indices, in the order the indices are given."""
+    return [messages[index] for index in indices]
+
+
 def _messages_except(messages: list[ChatMessage], indices: list[int]) -> list[ChatMessage]:
     """Return the messages the given indices leave out, in conversation order."""
     left_out = set(indices)

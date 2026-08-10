@@ -14,6 +14,7 @@ from haystack.hooks.compaction.utils import (
     _is_compaction_message,
     _latest_user_index,
     _leading_system_end,
+    _messages_at,
     _messages_except,
 )
 from haystack.token_counters import TokenCounter
@@ -34,11 +35,6 @@ _DEFAULT_OMISSION_NOTE = (
 def _is_compaction_note(message: ChatMessage) -> bool:
     """Whether a message is an omission note this strategy left in place of removed history."""
     return _is_compaction_message(message=message, strategy=_STRATEGY, role=ChatRole.USER)
-
-
-def _messages_at(messages: list[ChatMessage], indices: list[int]) -> list[ChatMessage]:
-    """Return the messages at the given indices, in the order the indices are given."""
-    return [messages[index] for index in indices]
 
 
 def _flatten(groups: list[list[int]]) -> list[int]:
