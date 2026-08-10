@@ -55,18 +55,22 @@ def _is_summary(message: ChatMessage) -> bool:
     return _is_compaction_message(message=message, strategy=_STRATEGY)
 
 
-def _summary_indices(messages: list[ChatMessage], start: int, end: int) -> list[int]:
-    """Return the positions of this strategy's summaries within a bounded part of a conversation."""
+def _previous_summary_indices(messages: list[ChatMessage], start: int, end: int) -> list[int]:
+    """Return the positions of the summaries an earlier compaction left in a bounded part of a conversation."""
     return [index for index in range(start, end) if _is_summary(message=messages[index])]
 
 
-def _summarizable_turn_groups(messages: list[ChatMessage], system_end: int, task_index: int | None) -> list[list[int]]:
+def _raw_historical_turn_groups(
+    messages: list[ChatMessage], system_end: int, task_index: int | None
+) -> list[list[int]]:
     """
-    Return the historical turns that still hold raw conversation, oldest turn first.
+    Return the historical turns that still hold raw, never-summarized conversation, oldest turn first.
 
-    Summaries this strategy already wrote are left out of their turn, so summarizing the turn folds that summary into
-    the summary this run produces. A turn that is nothing but summaries has nothing left to give up and is dropped.
+    Summaries an earlier compaction wrote are excluded, so summarizing a turn leaves them in place for
+    `_HISTORICAL_SUMMARIES` to fold later. The list is empty when there are no historical turns, or when every one of
+    them is already nothing but summaries.
     """
+    # Strip the previous summaries out of each turn, then drop the turns that strip away to nothing.
     groups = [
         [index for index in group if not _is_summary(message=messages[index])]
         for group in _historical_turn_groups(messages=messages, system_end=system_end, task_index=task_index)
@@ -106,9 +110,11 @@ def _summary_message(text: str, summarized_messages: int, source: str) -> ChatMe
 def _replace_indices(messages: list[ChatMessage], indices: list[int], summary: ChatMessage) -> list[ChatMessage]:
     """Replace the selected messages, which need not be contiguous, with one summary at the oldest one's position."""
     selected = set(indices)
+    # The summary stands in for everything it replaced, so it takes the position of the oldest message it covers.
     insertion_index = min(indices)
     compacted: list[ChatMessage] = []
     for index, message in enumerate(messages):
+        # Emit the summary before the message it displaces, so the surrounding conversation keeps its order.
         if index == insertion_index:
             compacted.append(summary)
         if index not in selected:
@@ -191,11 +197,14 @@ class SummarizationCompactor(Compactor):
         :param token_counter: The counter used both to plan compaction and verify generated summaries.
         :returns: A smaller replacement conversation, or None when nothing was reduced.
         """
+        # How large each summary may be, and the run kwargs, if any, that hold the generator to it.
         summary_tokens, run_kwargs = self._summary_limit()
-        working = list(messages)
+        # Rebound only when a summary is applied, and never mutated, so `messages` is left as the caller passed it.
+        compacted = messages
         while True:
+            # Ask which stretch of the conversation to give up next. None means the target is met or nothing is left.
             plan = self._next_summary(
-                messages=working,
+                messages=compacted,
                 target_tokens=target_tokens,
                 token_counter=token_counter,
                 summary_tokens=summary_tokens,
@@ -203,16 +212,21 @@ class SummarizationCompactor(Compactor):
             if plan is None:
                 break
             indices, source = plan
-            prompt = self._prompt(messages=working, indices=indices, summary_tokens=summary_tokens)
+            prompt = self._prompt(messages=compacted, indices=indices, summary_tokens=summary_tokens)
             try:
+                # Summarize that stretch and swap it in, so the next round plans against the smaller conversation.
+                # A generator error or a summary that does not shrink raises out of here.
                 result = self.chat_generator.run(messages=prompt, **run_kwargs)
-                working = self._apply_summary(
-                    messages=working, indices=indices, source=source, result=result, token_counter=token_counter
+                compacted = self._apply_summary(
+                    messages=compacted, indices=indices, source=source, result=result, token_counter=token_counter
                 )
             except Exception as error:
+                # Stop at the last summary that worked, unless `raise_on_failure` says to propagate.
                 self._report_failure(error=error)
                 break
-        return self._reduced(original=messages, working=working, token_counter=token_counter)
+        # Every applied summary was measured as shrinking the conversation, so reaching here with anything other than
+        # the untouched input means real progress, whether or not the target was met.
+        return None if compacted is messages else compacted
 
     async def compact_async(
         self, messages: list[ChatMessage], target_tokens: int, token_counter: TokenCounter
@@ -225,11 +239,14 @@ class SummarizationCompactor(Compactor):
         :param token_counter: The counter used both to plan compaction and verify generated summaries.
         :returns: A smaller replacement conversation, or None when nothing was reduced.
         """
+        # How large each summary may be, and the run kwargs, if any, that hold the generator to it.
         summary_tokens, run_kwargs = self._summary_limit()
-        working = list(messages)
+        # Rebound only when a summary is applied, and never mutated, so `messages` is left as the caller passed it.
+        compacted = messages
         while True:
+            # Ask which stretch of the conversation to give up next. None means the target is met or nothing is left.
             plan = self._next_summary(
-                messages=working,
+                messages=compacted,
                 target_tokens=target_tokens,
                 token_counter=token_counter,
                 summary_tokens=summary_tokens,
@@ -237,18 +254,23 @@ class SummarizationCompactor(Compactor):
             if plan is None:
                 break
             indices, source = plan
-            prompt = self._prompt(messages=working, indices=indices, summary_tokens=summary_tokens)
+            prompt = self._prompt(messages=compacted, indices=indices, summary_tokens=summary_tokens)
             try:
+                # Summarize that stretch and swap it in, so the next round plans against the smaller conversation.
+                # Only the generator call is awaited; planning and swapping are pure.
                 result = await _execute_component_async(
                     component_instance=self.chat_generator, messages=prompt, **run_kwargs
                 )
-                working = self._apply_summary(
-                    messages=working, indices=indices, source=source, result=result, token_counter=token_counter
+                compacted = self._apply_summary(
+                    messages=compacted, indices=indices, source=source, result=result, token_counter=token_counter
                 )
             except Exception as error:
+                # Stop at the last summary that worked, unless `raise_on_failure` says to propagate.
                 self._report_failure(error=error)
                 break
-        return self._reduced(original=messages, working=working, token_counter=token_counter)
+        # Every applied summary was measured as shrinking the conversation, so reaching here with anything other than
+        # the untouched input means real progress, whether or not the target was met.
+        return None if compacted is messages else compacted
 
     def _next_summary(
         self, messages: list[ChatMessage], target_tokens: int, token_counter: TokenCounter, summary_tokens: int
@@ -271,6 +293,7 @@ class SummarizationCompactor(Compactor):
         :returns: The message indices to summarize and the `source` to record on the resulting summary, or None when
             the conversation already fits or nothing is left that may be given up.
         """
+        # Nothing to give up once the conversation fits.
         if token_counter.count(messages=messages) <= target_tokens:
             return None
 
@@ -281,34 +304,39 @@ class SummarizationCompactor(Compactor):
         history_end = task_index if task_index is not None else system_end
         task_start = task_index + 1 if task_index is not None else system_end
 
-        turns = _summarizable_turn_groups(messages=messages, system_end=system_end, task_index=task_index)
-        if turns:
+        # Tier 1. Raw history is the cheapest context to lose, so take the oldest turns that still hold any.
+        historical_turns = _raw_historical_turn_groups(messages=messages, system_end=system_end, task_index=task_index)
+        if historical_turns:
             oldest_turns = _groups_to_summarize(
                 messages=messages,
-                groups=turns,
+                groups=historical_turns,
                 target_tokens=target_tokens,
                 summary_tokens=summary_tokens,
                 token_counter=token_counter,
             )
             return oldest_turns, _HISTORICAL_TURNS
 
-        history_summaries = _summary_indices(messages=messages, start=system_end, end=history_end)
+        # Tier 2. History is nothing but summaries now, so the only room left there is in folding them into one. They
+        # are left to accumulate until this point so that they are not rewritten on every compaction.
+        history_summaries = _previous_summary_indices(messages=messages, start=system_end, end=history_end)
         if len(history_summaries) > 1:
             return history_summaries, _HISTORICAL_SUMMARIES
 
-        # Only steps older than the `min_keep_steps` most recent ones may be given up.
-        steps = _current_step_groups(messages=messages, system_end=system_end, task_index=task_index)
-        eligible = steps[: max(len(steps) - self.min_keep_steps, 0)]
-        if not eligible:
+        # History is exhausted, so the current task has to pay. Its `min_keep_steps` newest steps are off limits.
+        agent_steps = _current_step_groups(messages=messages, system_end=system_end, task_index=task_index)
+        eligible_steps = agent_steps[: max(len(agent_steps) - self.min_keep_steps, 0)]
+        if not eligible_steps:
             return None
 
-        task_summaries = _summary_indices(messages=messages, start=task_start, end=len(messages))
+        # Tier 3. Fold the summaries earlier steps left behind before spending another raw step on the same space.
+        task_summaries = _previous_summary_indices(messages=messages, start=task_start, end=len(messages))
         if len(task_summaries) > 1:
             return task_summaries, _CURRENT_TASK_SUMMARIES
 
+        # Tier 4. Last resort: give up the oldest steps of the task the Agent is working on right now.
         oldest_steps = _groups_to_summarize(
             messages=messages,
-            groups=eligible,
+            groups=eligible_steps,
             target_tokens=target_tokens,
             summary_tokens=summary_tokens,
             token_counter=token_counter,
@@ -316,7 +344,18 @@ class SummarizationCompactor(Compactor):
         return oldest_steps, _CURRENT_TASK_STEPS
 
     def _summary_limit(self) -> tuple[int, dict[str, Any]]:
-        """Return the token budget for one summary and the run kwargs, if any, that ask the generator to honor it."""
+        """
+        Work out how large one summary may be and how to hold the Chat Generator to it.
+
+        :returns: A tuple containing:
+
+            1. The token budget for a single summary. This is `max_summary_tokens`, unless the generator already
+               configures a recognized output limit of its own, in which case the generator's setting wins.
+            2. The kwargs to pass to the generator's `run`. This carries a `generation_kwargs` entry for a built-in
+               generator that has no limit configured, and is empty for every other generator, since the
+               `ChatGenerator` protocol does not standardize the setting. When it is empty, the budget reaches the
+               model only as prompt guidance and `_apply_summary` measures the result instead.
+        """
         summary_tokens, generation_kwargs = _resolve_output_token_limit(
             chat_generator=self.chat_generator, default_limit=self.max_summary_tokens
         )
@@ -372,15 +411,6 @@ class SummarizationCompactor(Compactor):
             "Error: {error}",
             error=error,
         )
-
-    @staticmethod
-    def _reduced(
-        original: list[ChatMessage], working: list[ChatMessage], token_counter: TokenCounter
-    ) -> list[ChatMessage] | None:
-        """Return partial or complete progress only when it made the original conversation smaller."""
-        if token_counter.count(messages=working) < token_counter.count(messages=original):
-            return working
-        return None
 
     def warm_up(self) -> None:
         """Warm up the Chat Generator that writes summaries."""
