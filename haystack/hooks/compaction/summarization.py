@@ -8,7 +8,8 @@ from haystack import logging
 from haystack.components.generators.chat.types import ChatGenerator
 from haystack.components.generators.chat.utils import _resolve_output_token_limit
 from haystack.core.serialization import component_to_dict, default_from_dict, default_to_dict
-from haystack.dataclasses import ChatMessage
+from haystack.dataclasses import ChatMessage, FileContent, ImageContent
+from haystack.dataclasses.chat_message import ChatMessageContentT
 from haystack.hooks.compaction.types import Compactor
 from haystack.hooks.compaction.utils import (
     _COMPACTION_META_KEY,
@@ -46,8 +47,32 @@ agent can keep working with fewer tokens. Write a self-contained summary that pr
 - Exact file paths, URLs, identifiers, and references to stored data.
 - Unresolved work and the immediate next step.
 
+Images and files appear only as <image: ...> and <file: ...> placeholders; their contents are not available to you \
+and will be lost. Keep the names and details shown in the placeholder, along with whatever the conversation says \
+about them, so they can be supplied again if they are needed.
+
 Fold any existing <conversation_summary> blocks into one summary. Record only what the conversation shows. Do not \
 infer or add advice. Use plain prose or short bullets, and do not address the user."""
+
+
+def _identifying_details(metadata: dict[str, Any]) -> list[str]:
+    """Render an attachment's metadata as `key=value` pairs, such as the path a file was loaded from."""
+    # For ease, we don't support nested keys, we are mostly interested in the top-level keys that identify the
+    # attachment, such as a file path or URL.
+    return [f"{key}={value}" for key, value in sorted(metadata.items()) if isinstance(value, (str, int, float, bool))]
+
+
+def _attachment_placeholder(content: ChatMessageContentT) -> str:
+    """
+    Render a placeholder for an attachment that cannot survive summarization, so the summary can preserve its identity.
+    """
+    if isinstance(content, ImageContent):
+        # Images have no filename, so whatever identifies one lives in its `meta`.
+        return f"<image: {', '.join([content.mime_type or 'unknown type', *_identifying_details(content.meta)])}>"
+    if isinstance(content, FileContent):
+        details = [content.filename or "unnamed", content.mime_type or "unknown type"]
+        return f"<file: {', '.join([*details, *_identifying_details(content.extra)])}>"
+    return f"<{type(content).__name__}>"
 
 
 def _is_summary(message: ChatMessage) -> bool:
@@ -160,7 +185,7 @@ class SummarizationCompactor(Compactor):
         *,
         min_keep_steps: int = 1,
         max_summary_tokens: int = 1024,
-        summary_instruction: str | None = None,
+        summary_instruction: str = _DEFAULT_SUMMARY_INSTRUCTION,
         raise_on_failure: bool = False,
     ) -> None:
         """
@@ -171,7 +196,10 @@ class SummarizationCompactor(Compactor):
         :param min_keep_steps: The fewest complete recent Agent steps to keep, even when they exceed the target.
         :param max_summary_tokens: The output-token budget reserved for each summary. Known built-in generators receive
             the corresponding runtime generation setting unless one is already configured on the generator.
-        :param summary_instruction: An instruction replacing the built-in summary prompt.
+        :param summary_instruction: What the model is told to preserve when it writes a summary. The default asks for
+            the user's goal, decisions and their reasoning, completed work, exact identifiers, the names of attachments
+            that cannot survive summarization, and the next step. The token budget is appended to whatever is given
+            here, so a replacement does not need to mention it.
         :param raise_on_failure: Whether a failed or non-shrinking summarization raises. By default the failure is
             logged and any successful partial compaction is returned.
         :raises ValueError: If `min_keep_steps` is negative or `max_summary_tokens` is not positive.
@@ -183,7 +211,7 @@ class SummarizationCompactor(Compactor):
         self.chat_generator = chat_generator
         self.min_keep_steps = min_keep_steps
         self.max_summary_tokens = max_summary_tokens
-        self.summary_instruction = summary_instruction or _DEFAULT_SUMMARY_INSTRUCTION
+        self.summary_instruction = summary_instruction
         self.raise_on_failure = raise_on_failure
 
     def compact(
@@ -359,7 +387,9 @@ class SummarizationCompactor(Compactor):
 
     def _prompt(self, messages: list[ChatMessage], indices: list[int], summary_tokens: int) -> list[ChatMessage]:
         """Build the bounded summarization instruction and the rendered transcript of the selected messages."""
-        transcript = _rendered_conversation(_messages_at(messages=messages, indices=indices))
+        transcript = _rendered_conversation(
+            _messages_at(messages=messages, indices=indices), placeholder=_attachment_placeholder
+        )
         instruction = (
             f"{self.summary_instruction}\n\nWrite a complete summary in no more than approximately "
             f"{summary_tokens} tokens. Prioritize completeness within that limit so the response is not cut off."
