@@ -39,20 +39,37 @@ _HISTORICAL_SUMMARIES = "historical_summaries"
 _CURRENT_TASK_SUMMARIES = "current_task_summaries"
 _CURRENT_TASK_STEPS = "current_task_steps"
 
-_DEFAULT_SUMMARY_INSTRUCTION = """You are compacting part of a conversation between a user and an AI agent so the \
-agent can keep working with fewer tokens. Write a self-contained summary that preserves:
-- The user's goal, requirements, constraints, and preferences.
-- Decisions and the reasoning behind them.
-- Work already completed and important tool results.
-- Exact file paths, URLs, identifiers, and references to stored data.
-- Unresolved work and the immediate next step.
+_DEFAULT_SUMMARY_INSTRUCTION = """You are compacting one portion of a conversation between a user and an AI agent so \
+the agent can keep working with fewer tokens. You are shown only the portion being replaced. The rest of the \
+conversation, including the user's current request, stays in place and is not shown to you. Summarize only what you \
+are given, and never say or imply that something did not happen just because it is absent from this portion.
 
-Images and files appear only as <image: ...> and <file: ...> placeholders; their contents are not available to you \
-and will be lost. Keep the names and details shown in the placeholder, along with whatever the conversation says \
-about them, so they can be supplied again if they are needed.
+Use these sections, in this order. Keep every section, and write "(none)" when this portion says nothing about it.
 
-Fold any existing <conversation_summary> blocks into one summary. Record only what the conversation shows. Do not \
-infer or add advice. Use plain prose or short bullets, and do not address the user."""
+## Objective
+What the user was trying to accomplish, if this portion shows it.
+
+## Decisions and constraints
+Choices made and the reasoning behind them, and any requirements, preferences, or instructions the user gave. Note \
+options that were rejected and why.
+
+## Work completed
+What was done, and what the tool results established.
+
+## Identifiers
+Exact file paths, URLs, IDs, names, commands, and error strings, copied character for character. Images and files \
+appear only as <image: ...> and <file: ...> placeholders; their contents are not available to you and are lost once \
+this portion is replaced, so copy the placeholder details here.
+
+## Unresolved
+Work still outstanding, and the immediate next step.
+
+Rules:
+- Record only what this portion shows. Do not infer, do not give advice, and do not add anything that is not here.
+- Copy identifiers exactly rather than describing them. They cannot be recovered once this portion is gone.
+- Fold any <conversation_summary> blocks you are given into your own: keep what is still true, drop what is now \
+stale, and merge in the new facts.
+- Use terse bullets. Do not address the user, and do not mention that you are summarizing."""
 
 
 def _identifying_details(metadata: dict[str, Any]) -> list[str]:
@@ -197,9 +214,11 @@ class SummarizationCompactor(Compactor):
         :param max_summary_tokens: The output-token budget reserved for each summary. Known built-in generators receive
             the corresponding runtime generation setting unless one is already configured on the generator.
         :param summary_instruction: What the model is told to preserve when it writes a summary. The default asks for
-            the user's goal, decisions and their reasoning, completed work, exact identifiers, the names of attachments
-            that cannot survive summarization, and the next step. The token budget is appended to whatever is given
-            here, so a replacement does not need to mention it.
+            fixed sections covering the objective, decisions and constraints, completed work, exact identifiers, and
+            unresolved work, each written as `(none)` when the summarized portion says nothing about it. It also states
+            that only part of the conversation is shown, so the model does not conclude that something never happened
+            just because it is absent. The token budget is appended to whatever is given here, so a replacement does
+            not need to mention it.
         :param raise_on_failure: Whether a failed or non-shrinking summarization raises. By default the failure is
             logged and any successful partial compaction is returned.
         :raises ValueError: If `min_keep_steps` is negative or `max_summary_tokens` is not positive.
