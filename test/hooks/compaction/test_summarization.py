@@ -5,8 +5,9 @@
 import pytest
 
 from haystack.components.generators.chat import MockChatGenerator
-from haystack.dataclasses import ChatMessage, ChatRole
+from haystack.dataclasses import ChatMessage, ChatRole, FileContent, ImageContent, TextContent, ToolCall
 from haystack.hooks.compaction import SummarizationCompactor
+from haystack.hooks.compaction.summarization import _attachment_placeholder
 from haystack.hooks.compaction.utils import _COMPACTION_META_KEY
 from test.hooks.compaction.helpers import FakeCounter, tool_call, tool_result
 
@@ -75,6 +76,38 @@ def a_task_with_two_steps() -> list[ChatMessage]:
         tool_call("new"),
         tool_result("new result", call_id="new"),
     ]
+
+
+class TestAttachmentPlaceholder:
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            pytest.param(ImageContent(base64_image="Zm9v", mime_type="image/png"), "<image: image/png>", id="image"),
+            pytest.param(
+                ImageContent(base64_image="Zm9v", mime_type="image/png", meta={"file_path": "/tmp/shot.png"}),
+                "<image: image/png, file_path=/tmp/shot.png>",
+                id="image-named-by-meta",
+            ),
+            pytest.param(
+                FileContent(base64_data="Zm9v", mime_type="application/pdf", filename="q3.pdf"),
+                "<file: q3.pdf, application/pdf>",
+                id="file",
+            ),
+            pytest.param(
+                FileContent(base64_data="Zm9v", mime_type="application/pdf", extra={"page": 4}),
+                "<file: unnamed, application/pdf, page=4>",
+                id="file-unnamed-with-extra",
+            ),
+            # A nested value could be arbitrarily large, so it is left out rather than bloating the prompt.
+            pytest.param(
+                ImageContent(base64_image="Zm9v", mime_type="image/png", meta={"boxes": [[1, 2], [3, 4]]}),
+                "<image: image/png>",
+                id="nested-metadata-left-out",
+            ),
+        ],
+    )
+    def test_names_the_attachment(self, content, expected):
+        assert _attachment_placeholder(content) == expected
 
 
 class TestSummarizationCompactor:
@@ -170,6 +203,28 @@ class TestSummarizationCompactor:
         )
         result = compacted or messages
         assert sum(message.is_from(role=ChatRole.ASSISTANT) for message in result) == expected
+
+    def test_attachments_are_named_in_the_transcript(self):
+        image = ImageContent(base64_image="Zm9v", mime_type="image/png", meta={"file_path": "/tmp/shot.png"})
+        pdf = FileContent(base64_data="Zm9v", mime_type="application/pdf", filename="q3.pdf")
+        messages = [
+            ChatMessage.from_system("rules"),
+            ChatMessage.from_user(content_parts=["review this " * 20, pdf]),
+            tool_call("c1"),
+            # An attachment a tool returned is nested inside the tool result rather than on the message.
+            ChatMessage.from_tool(
+                tool_result=[TextContent(text="captured " * 20), image],
+                origin=ToolCall(tool_name="browse", arguments={}, id="c1"),
+            ),
+            ChatMessage.from_user("current task"),
+        ]
+        generator, prompts = summarizer("summary")
+        SummarizationCompactor(generator, max_summary_tokens=1).compact(
+            messages=messages, target_tokens=SMALLEST, token_counter=COUNTER
+        )
+        # The summary cannot reproduce either attachment, so the transcript has to name them well enough to ask again.
+        assert "<file: q3.pdf, application/pdf>" in prompts[0]
+        assert "<image: image/png, file_path=/tmp/shot.png>" in prompts[0]
 
     def test_custom_summary_instruction_replaces_the_default(self):
         generator, prompts = summarizer("summary")
